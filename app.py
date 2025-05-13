@@ -33,8 +33,8 @@ import time
 # CONFIGURATION SECTION
 # ===========================
 # Replace these with your actual API keys
-GOOGLE_API_KEY = "AIzaSyAXfOWG9HFKG-QN9CS_Fj0FhA8nOsr0V3Q"  # Get from https://makersuite.google.com/app/apikey
-PINECONE_API_KEY = "pcsk_3MQvt1_Sq3wG8ZKf9tsj2E1Lj8sUzy5XSMUxfnYEfekwWCTcgMtRPRQap1HkLRd7Wx4bNd"  # Get from https://www.pinecone.io/
+GOOGLE_API_KEY = "put-your-key"  # Get from https://makersuite.google.com/app/apikey
+PINECONE_API_KEY = "put-your-key"  # Get from https://www.pinecone.io/
 
 # Initialize Gemini API
 # This configures the Google Generative AI library with your API key
@@ -287,7 +287,7 @@ class GeminiHandler:
         """
         st.write("🔄 Initializing Gemini AI...")
         # Initialize the Gemini Pro model
-        self.model = genai.GenerativeModel('gemini-pro')
+        self.model = genai.GenerativeModel('gemini-1.5-flash')
         # Store chat sessions for conversation memory
         self.chat_sessions = {}
         st.write("✅ Gemini AI ready!")
