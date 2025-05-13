@@ -10,7 +10,7 @@
 
 ### Step 1: Install Dependencies
 ```bash
-pip install streamlit google-generativeai PyPDF2 pinecone-client sentence-transformers langdetect
+pip install streamlit google-generativeai PyPDF2 pinecone sentence-transformers langdetect
 ```
 
 ### Step 2: Get API Keys
