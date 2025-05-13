@@ -1,0 +1,751 @@
+"""
+RAG System with Multi-Language Agents - Educational Version
+===========================================================
+
+This script demonstrates a complete RAG (Retrieval-Augmented Generation) system
+with multi-language support using Google Gemini API and Pinecone vector database.
+
+Key Components:
+1. Document Processing (PDF upload and embedding)
+2. Pinecone Vector Storage
+3. Multi-Language Agent System
+4. Streamlit Frontend
+5. Conversation Memory
+
+Author: Educational Purpose
+"""
+
+import streamlit as st
+import google.generativeai as genai
+import PyPDF2
+from pinecone import Pinecone, ServerlessSpec  # Updated import for new Pinecone API
+from sentence_transformers import SentenceTransformer
+import hashlib
+import uuid
+import langdetect
+import os
+from io import BytesIO
+from datetime import datetime 
+import json
+import time
+
+# ===========================
+# CONFIGURATION SECTION
+# ===========================
+# Replace these with your actual API keys
+GOOGLE_API_KEY = "AIzaSyAXfOWG9HFKG-QN9CS_Fj0FhA8nOsr0V3Q"  # Get from https://makersuite.google.com/app/apikey
+PINECONE_API_KEY = "pcsk_3MQvt1_Sq3wG8ZKf9tsj2E1Lj8sUzy5XSMUxfnYEfekwWCTcgMtRPRQap1HkLRd7Wx4bNd"  # Get from https://www.pinecone.io/
+
+# Initialize Gemini API
+# This configures the Google Generative AI library with your API key
+genai.configure(api_key=GOOGLE_API_KEY)
+
+# ===========================
+# STREAMLIT PAGE CONFIGURATION
+# ===========================
+# Configure the Streamlit page with custom title, layout, and icon
+st.set_page_config(
+    page_title="🤖 RAG Multi-Language System",
+    layout="wide",  # Use full width of the screen
+    page_icon="🤖",
+    initial_sidebar_state="expanded"  # Start with sidebar open
+)
+
+# ===========================
+# DOCUMENT PROCESSOR CLASS
+# ===========================
+class DocumentProcessor:
+    """
+    Handles PDF document processing, text extraction, chunking, and embedding creation.
+    
+    This class is responsible for:
+    - Reading PDF files
+    - Extracting text from PDFs
+    - Breaking text into smaller chunks
+    - Creating embeddings using SentenceTransformers
+    - Caching results for performance
+    """
+    
+    def __init__(self):
+        """
+        Initialize the document processor with:
+        - SentenceTransformer model for embeddings
+        - Memory cache for storing processed results
+        """
+        # Load a pre-trained sentence transformer model
+        # This model converts text into 384-dimensional vectors
+        st.write("🔄 Initializing Document Processor...")
+        self.model = SentenceTransformer('all-MiniLM-L6-v2')
+        self.memory_cache = {}  # Cache to avoid reprocessing same documents
+        st.write("✅ Document Processor ready!")
+    
+    def extract_text_from_pdf(self, pdf_file):
+        """
+        Extract text from a PDF file with caching mechanism.
+        
+        Args:
+            pdf_file: Uploaded PDF file object
+            
+        Returns:
+            str: Extracted text from the PDF
+        """
+        # Create a unique hash for the file to use as cache key
+        # This allows us to skip processing if we've seen this file before
+        file_hash = hashlib.md5(pdf_file.read()).hexdigest()
+        pdf_file.seek(0)  # Reset file pointer to beginning
+        
+        # Check if we've already processed this file
+        if file_hash in self.memory_cache:
+            st.success("📋 Using cached version of this document")
+            return self.memory_cache[file_hash]
+        
+        # Read the PDF file
+        st.write("📖 Extracting text from PDF...")
+        pdf_reader = PyPDF2.PdfReader(BytesIO(pdf_file.read()))
+        text = ""
+        
+        # Extract text from each page
+        for i, page in enumerate(pdf_reader.pages):
+            st.write(f"📄 Processing page {i+1}/{len(pdf_reader.pages)}")
+            text += page.extract_text()
+        
+        # Store in cache for future use
+        self.memory_cache[file_hash] = text
+        st.success(f"✅ Extracted {len(text)} characters from PDF")
+        return text
+    
+    def chunk_text(self, text, chunk_size=1000, overlap=200):
+        """
+        Split text into overlapping chunks for better retrieval.
+        
+        Overlapping chunks ensure that information spanning chunk boundaries
+        is not lost during retrieval.
+        
+        Args:
+            text: Input text to chunk
+            chunk_size: Maximum size of each chunk
+            overlap: Number of characters to overlap between chunks
+            
+        Returns:
+            list: List of text chunks
+        """
+        st.write("✂️ Splitting text into chunks...")
+        chunks = []
+        start = 0
+        
+        while start < len(text):
+            end = start + chunk_size
+            chunk = text[start:end]
+            chunks.append(chunk)
+            start = end - overlap  # Create overlap for better context
+        
+        st.success(f"✅ Created {len(chunks)} chunks")
+        return chunks
+    
+    def create_embeddings(self, texts):
+        """
+        Convert text chunks into vector embeddings.
+        
+        Embeddings are numerical representations of text that capture
+        semantic meaning, allowing us to find similar content.
+        
+        Args:
+            texts: List of text strings to embed
+            
+        Returns:
+            list: List of embedding vectors
+        """
+        st.write("🔢 Creating embeddings...")
+        with st.spinner("Generating embeddings..."):
+            # Use the SentenceTransformer model to create embeddings
+            embeddings = self.model.encode(texts).tolist()
+        st.success(f"✅ Created {len(embeddings)} embeddings")
+        return embeddings
+
+# ===========================
+# PINECONE HANDLER CLASS (UPDATED FOR NEW API)
+# ===========================
+class PineconeHandler:
+    """
+    Manages vector storage and retrieval using Pinecone database.
+    
+    Pinecone is a managed vector database that allows us to:
+    - Store document embeddings
+    - Perform similarity searches
+    - Retrieve relevant context for queries
+    """
+    
+    def __init__(self):
+        """
+        Initialize Pinecone connection and create index if needed.
+        """
+        st.write("🔄 Connecting to Pinecone...")
+        
+        # NEW API: Create a Pinecone instance
+        self.pc = Pinecone(api_key=PINECONE_API_KEY)
+        self.index_name = "rag-documents"
+        self._ensure_index_exists()
+        st.write("✅ Pinecone connection established!")
+        
+    def _ensure_index_exists(self):
+        """
+        Create Pinecone index if it doesn't exist.
+        
+        The index stores our document embeddings with metadata.
+        """
+        # NEW API: Check if index exists using list_indexes()
+        existing_indexes = [idx.name for idx in self.pc.list_indexes()]
+        
+        if self.index_name not in existing_indexes:
+            st.write("🏗️ Creating new Pinecone index...")
+            
+            # NEW API: Create index with ServerlessSpec
+            self.pc.create_index(
+                name=self.index_name,
+                dimension=384,  # Must match SentenceTransformer output dimension
+                metric="cosine",  # Cosine similarity for semantic search
+                spec=ServerlessSpec(
+                    cloud='aws',
+                    region='us-east-1'
+                )
+            )
+            st.success("✅ Pinecone index created!")
+        else:
+            st.write("✅ Using existing Pinecone index")
+        
+        # Connect to the index
+        self.index = self.pc.Index(self.index_name)
+    
+    def upsert_vectors(self, vectors, texts, file_name):
+        """
+        Store vectors in Pinecone with metadata.
+        
+        Args:
+            vectors: List of embedding vectors
+            texts: Corresponding text chunks
+            file_name: Source file name for metadata
+        """
+        st.write("💾 Storing vectors in Pinecone...")
+        
+        # NEW API: Prepare vectors in dictionary format
+        vectors_to_upsert = [
+            {
+                "id": f"{file_name}_{i}",  # Unique ID
+                "values": vector,  # Embedding vector
+                "metadata": {
+                    "text": text,  # Original text chunk
+                    "source": file_name,  # Source file
+                    "timestamp": datetime.now().isoformat()  # Upload time
+                }
+            }
+            for i, (vector, text) in enumerate(zip(vectors, texts))
+        ]
+        
+        # Upload to Pinecone
+        self.index.upsert(vectors=vectors_to_upsert)
+        st.success(f"✅ Stored {len(vectors_to_upsert)} vectors in Pinecone")
+    
+    def query_vectors(self, query_vector, top_k=3):
+        """
+        Search for similar vectors in Pinecone.
+        
+        Args:
+            query_vector: Query embedding to search for
+            top_k: Number of similar results to return
+            
+        Returns:
+            Query results with matches and metadata
+        """
+        st.write("🔍 Searching for relevant documents...")
+        
+        # Query Pinecone for similar vectors
+        results = self.index.query(
+            vector=query_vector,
+            top_k=top_k,
+            include_metadata=True  # Include text and source info
+        )
+        
+        st.success(f"✅ Found {len(results.matches)} relevant matches")
+        return results
+
+# ===========================
+# GEMINI HANDLER CLASS
+# ===========================
+class GeminiHandler:
+    """
+    Manages interactions with Google's Gemini AI model.
+    
+    This class handles:
+    - Conversation management
+    - Response generation
+    - Session persistence
+    """
+    
+    def __init__(self):
+        """
+        Initialize Gemini model and conversation storage.
+        """
+        st.write("🔄 Initializing Gemini AI...")
+        # Initialize the Gemini Pro model
+        self.model = genai.GenerativeModel('gemini-pro')
+        # Store chat sessions for conversation memory
+        self.chat_sessions = {}
+        st.write("✅ Gemini AI ready!")
+    
+    def get_response(self, prompt, session_id=None):
+        """
+        Generate response from Gemini with conversation memory.
+        
+        Args:
+            prompt: Input prompt for the AI
+            session_id: Optional session ID for conversation continuity
+            
+        Returns:
+            str: AI-generated response
+        """
+        try:
+            # Check if we have an existing conversation
+            if session_id and session_id in self.chat_sessions:
+                # Continue existing conversation
+                chat = self.chat_sessions[session_id]
+                response = chat.send_message(prompt)
+            else:
+                # Start new conversation
+                chat = self.model.start_chat(history=[])
+                response = chat.send_message(prompt)
+                # Save for future use if session_id provided
+                if session_id:
+                    self.chat_sessions[session_id] = chat
+            
+            return response.text
+        except Exception as e:
+            # Handle errors gracefully
+            error_msg = f"Error generating response: {str(e)}"
+            st.error(error_msg)
+            return error_msg
+
+# ===========================
+# MULTI-LANGUAGE AGENT CLASS
+# ===========================
+class MultiLanguageAgent:
+    """
+    Handles multi-language query processing and response generation.
+    
+    This agent:
+    - Detects the language of user queries
+    - Routes queries to language-specific prompts
+    - Generates responses in the appropriate language
+    """
+    
+    def __init__(self, gemini_handler):
+        """
+        Initialize with language-specific prompts.
+        
+        Args:
+            gemini_handler: GeminiHandler instance for AI responses
+        """
+        self.gemini = gemini_handler
+        
+        # Define language-specific system prompts
+        # These prompts instruct the AI to respond in specific languages
+        self.language_prompts = {
+            'en': "You are an English language specialist. Provide detailed and helpful responses in English based on the context provided.",
+            'es': "Eres un especialista en español. Proporciona respuestas detalladas y útiles en español basadas en el contexto proporcionado.",
+            'fr': "Vous êtes un spécialiste français. Fournissez des réponses détaillées et utiles en français basées sur le contexte fourni.",
+            'de': "Sie sind ein deutscher Sprachspezialist. Geben Sie detaillierte und hilfreiche Antworten auf Deutsch basierend auf dem bereitgestellten Kontext.",
+            'it': "Sei uno specialista italiano. Fornisci risposte dettagliate e utili in italiano basate sul contesto fornito.",
+            'pt': "Você é um especialista em português. Forneça respostas detalhadas e úteis em português com base no contexto fornecido.",
+            'zh': "你是中文专家。请根据提供的上下文，用中文提供详细且有用的回答。",
+            'ja': "あなたは日本語の専門家です。提供されたコンテキストに基づいて、日本語で詳細で役立つ回答を提供してください。"
+        }
+    
+    def detect_language(self, text):
+        """
+        Detect the language of input text.
+        
+        Args:
+            text: Input text to analyze
+            
+        Returns:
+            str: Language code (e.g., 'en', 'es', 'fr')
+        """
+        try:
+            # Use langdetect library to identify language
+            detected = langdetect.detect(text)
+            # Return detected language if we support it, otherwise default to English
+            return detected if detected in self.language_prompts else 'en'
+        except:
+            # If detection fails, default to English
+            return 'en'
+    
+    def get_response(self, query, context, language, session_id):
+        """
+        Generate a response in the appropriate language.
+        
+        Args:
+            query: User's question
+            context: Relevant context from documents
+            language: Target language for response
+            session_id: Session ID for conversation continuity
+            
+        Returns:
+            str: AI response in the target language
+        """
+        # Get language-specific system prompt
+        system_prompt = self.language_prompts.get(language, self.language_prompts['en'])
+        
+        # Construct the full prompt with context and query
+        prompt = f"""
+        {system_prompt}
+        
+        Context from documents:
+        {context}
+        
+        User query: {query}
+        
+        Please provide a comprehensive response in the detected language ({language}).
+        """
+        
+        # Generate response using Gemini
+        return self.gemini.get_response(prompt, session_id)
+
+# ===========================
+# INITIALIZATION FUNCTION
+# ===========================
+@st.cache_resource
+def initialize_system():
+    """
+    Initialize all system components.
+    
+    This function is cached by Streamlit to avoid reinitializing
+    components on every interaction.
+    
+    Returns:
+        tuple: Initialized components (doc_processor, pinecone_handler, gemini_handler, multi_agent)
+    """
+    st.write("🚀 Initializing RAG System...")
+    
+    # Create progress bar for initialization
+    progress_bar = st.progress(0)
+    
+    # Initialize Document Processor
+    progress_bar.progress(25)
+    doc_processor = DocumentProcessor()
+    
+    # Initialize Pinecone Handler
+    progress_bar.progress(50)
+    pinecone_handler = PineconeHandler()
+    
+    # Initialize Gemini Handler
+    progress_bar.progress(75)
+    gemini_handler = GeminiHandler()
+    
+    # Initialize Multi-Language Agent
+    progress_bar.progress(100)
+    multi_agent = MultiLanguageAgent(gemini_handler)
+    
+    progress_bar.empty()  # Remove progress bar
+    st.success("✅ All systems initialized!")
+    
+    return doc_processor, pinecone_handler, gemini_handler, multi_agent
+
+# ===========================
+# SESSION STATE INITIALIZATION
+# ===========================
+# Streamlit session state persists data across reruns
+# Initialize chat history if not exists
+if 'messages' not in st.session_state:
+    st.session_state.messages = []
+
+# Initialize session ID for conversation continuity
+if 'session_id' not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
+
+# Initialize processed documents tracking
+if 'processed_docs' not in st.session_state:
+    st.session_state.processed_docs = {}
+
+# ===========================
+# MAIN UI LAYOUT
+# ===========================
+# Page header with title and description
+st.title("🤖 RAG System with Multi-Language Agents")
+st.markdown("""
+### Welcome to the RAG (Retrieval-Augmented Generation) System!
+
+This application demonstrates:
+- 📄 **PDF Document Processing** with text extraction and chunking
+- 🔢 **Vector Embeddings** using SentenceTransformers
+- 💾 **Pinecone Vector Database** for semantic search
+- 🤖 **Google Gemini AI** for response generation
+- 🌐 **Multi-Language Support** with automatic detection
+- 💬 **Conversation Memory** for contextual responses
+""")
+
+# Create two columns for main layout
+col1, col2 = st.columns([2, 3])
+
+with col1:
+    st.header("📄 Document Manager")
+    
+    # File upload section
+    uploaded_file = st.file_uploader(
+        "Choose a PDF file",
+        type="pdf",
+        help="Upload a PDF document to chat with"
+    )
+
+# Initialize system components
+doc_processor, pinecone_handler, gemini_handler, multi_agent = initialize_system()
+
+# ===========================
+# DOCUMENT PROCESSING SECTION
+# ===========================
+with col1:
+    if uploaded_file is not None:
+        # Create a unique hash for the uploaded file
+        file_hash = hashlib.md5(uploaded_file.read()).hexdigest()
+        uploaded_file.seek(0)  # Reset file pointer
+        
+        # Check if document is already processed
+        if file_hash not in st.session_state.processed_docs:
+            # Show processing status
+            st.info("🔄 Processing document... This may take a moment.")
+            
+            # Create expandable section for processing details
+            with st.expander("👁️ View Processing Details", expanded=True):
+                # Extract text from PDF
+                text = doc_processor.extract_text_from_pdf(uploaded_file)
+                
+                # Split text into chunks
+                chunks = doc_processor.chunk_text(text)
+                
+                # Create embeddings for chunks
+                embeddings = doc_processor.create_embeddings(chunks)
+                
+                # Store in Pinecone
+                pinecone_handler.upsert_vectors(embeddings, chunks, uploaded_file.name)
+                
+                # Save to session state
+                st.session_state.processed_docs[file_hash] = {
+                    'name': uploaded_file.name,
+                    'chunks': len(chunks),
+                    'processed_at': datetime.now().isoformat()
+                }
+            
+            st.success("✅ Document processed successfully!")
+        else:
+            st.info("📋 This document has already been processed")
+    
+    # Display processed documents
+    if st.session_state.processed_docs:
+        st.subheader("📚 Processed Documents")
+        
+        # Create a nice display of processed documents
+        for doc_hash, doc_info in st.session_state.processed_docs.items():
+            with st.container():
+                st.write(f"**{doc_info['name']}**")
+                st.write(f"- {doc_info['chunks']} chunks created")
+                st.write(f"- Processed: {doc_info['processed_at'][:19]}")
+                st.markdown("---")
+    
+    # Memory management section
+    st.subheader("🧹 Memory Management")
+    if st.button("🗑️ Clear All Memory", type="secondary"):
+        st.session_state.messages = []
+        st.session_state.processed_docs = {}
+        gemini_handler.chat_sessions = {}
+        st.success("✅ All memory cleared!")
+        st.rerun()
+
+# ===========================
+# CHAT INTERFACE SECTION
+# ===========================
+with col2:
+    st.header("💬 Chat Interface")
+    
+    # Create container for chat history
+    chat_container = st.container()
+    
+    with chat_container:
+        # Display chat history
+        for i, message in enumerate(st.session_state.messages):
+            with st.chat_message(message["role"]):
+                st.write(message["content"])
+                
+                # Show language detection for assistant messages
+                if message["role"] == "assistant" and "language" in message:
+                    st.caption(f"🌐 Language: {message['language'].upper()}")
+                
+                # Show timestamp
+                if "timestamp" in message:
+                    st.caption(f"⏰ {message['timestamp']}")
+    
+    # Chat input
+    if query := st.chat_input("Ask me anything about your documents..."):
+        # Add timestamp to message
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        
+        # Add user message to chat history
+        st.session_state.messages.append({
+            "role": "user",
+            "content": query,
+            "timestamp": timestamp
+        })
+        
+        # Display user message
+        with chat_container:
+            with st.chat_message("user"):
+                st.write(query)
+                st.caption(f"⏰ {timestamp}")
+        
+        # Process the query
+        with st.spinner("🤔 Processing your question..."):
+            # Detect language of the query
+            language = multi_agent.detect_language(query)
+            
+            # Create embedding for the query
+            query_embedding = doc_processor.create_embeddings([query])[0]
+            
+            # Search for relevant documents in Pinecone
+            results = pinecone_handler.query_vectors(query_embedding)
+            
+            # Extract context from search results
+            context = ""
+            if results.matches:
+                context = "\n".join([match.metadata['text'] for match in results.matches])
+            
+            # Generate response using multi-language agent
+            response = multi_agent.get_response(query, context, language, st.session_state.session_id)
+        
+        # Add assistant response to chat history
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": response,
+            "language": language,
+            "timestamp": timestamp
+        })
+        
+        # Display assistant response
+        with chat_container:
+            with st.chat_message("assistant"):
+                st.write(response)
+                st.caption(f"🌐 Language: {language.upper()}")
+                st.caption(f"⏰ {timestamp}")
+        
+        # Rerun to update the interface
+        st.rerun()
+
+# ===========================
+# SIDEBAR INFORMATION
+# ===========================
+with st.sidebar:
+    st.header("📊 System Information")
+    
+    # Display session analytics
+    st.metric("Messages in Chat", len(st.session_state.messages))
+    st.metric("Documents Processed", len(st.session_state.processed_docs))
+    st.metric("Session ID", st.session_state.session_id[:8] + "...")
+    
+    # Export functionality
+    st.header("💾 Export Options")
+    if st.button("📥 Export Conversation"):
+        export_data = {
+            'session_id': st.session_state.session_id,
+            'messages': st.session_state.messages,
+            'processed_docs': st.session_state.processed_docs,
+            'export_timestamp': datetime.now().isoformat()
+        }
+        
+        json_data = json.dumps(export_data, indent=2)
+        
+        st.download_button(
+            label="💾 Download JSON",
+            data=json_data,
+            file_name=f"rag_conversation_{st.session_state.session_id[:8]}.json",
+            mime="application/json"
+        )
+    
+    # Help section
+    st.header("❓ Help & Instructions")
+    with st.expander("📖 How to Use", expanded=True):
+        st.markdown("""
+        **Step 1:** Upload a PDF document using the file uploader
+        
+        **Step 2:** Wait for the document to be processed (text extraction, chunking, embedding)
+        
+        **Step 3:** Ask questions about your document in any supported language
+        
+        **Step 4:** The system will automatically detect your language and respond accordingly
+        
+        **Step 5:** Use "Clear All Memory" to start fresh
+        """)
+    
+    # Supported languages
+    st.header("🌐 Supported Languages")
+    languages = {
+        'English': 'en',
+        'Spanish': 'es',
+        'French': 'fr',
+        'German': 'de',
+        'Italian': 'it',
+        'Portuguese': 'pt',
+        'Chinese': 'zh',
+        'Japanese': 'ja'
+    }
+    
+    for lang_name, lang_code in languages.items():
+        st.write(f"🌍 {lang_name} ({lang_code})")
+    
+    # Sample queries
+    st.header("💡 Sample Queries")
+    st.write("Try these example queries:")
+    
+    sample_queries = [
+        ("What is this document about?", "en"),
+        ("¿De qué trata este documento?", "es"),
+        ("De quoi parle ce document?", "fr"),
+        ("这个文档是关于什么的？", "zh"),
+        ("このドキュメントは何についてですか？", "ja")
+    ]
+    
+    for query, lang in sample_queries:
+        if st.button(f"{query} ({lang})", key=f"sample_{lang}"):
+            st.rerun()
+    
+    # Technical details
+    st.header("🔧 Technical Details")
+    with st.expander("⚙️ System Components"):
+        st.markdown("""
+        **Document Processing:**
+        - SentenceTransformers (all-MiniLM-L6-v2)
+        - PyPDF2 for text extraction
+        - Text chunking with overlap
+        
+        **Vector Storage:**
+        - Pinecone vector database
+        - 384-dimensional embeddings
+        - Cosine similarity search
+        
+        **AI Model:**
+        - Google Gemini Pro
+        - Multi-language support
+        - Conversation memory
+        
+        **Frontend:**
+        - Streamlit web interface
+        - Real-time chat interface
+        - Session state management
+        """)
+
+# ===========================
+# FOOTER
+# ===========================
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center'>
+    <p>Built with ❤️ using Streamlit, Google Gemini, and Pinecone</p>
+    <p>Educational RAG System for Multi-Language Document Chat</p>
+</div>
+""", unsafe_allow_html=True)
